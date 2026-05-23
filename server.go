@@ -36,7 +36,8 @@ import (
 type Server struct {
 	logger *log.Logger
 
-	broker base.Broker
+	broker  base.Broker
+	backend Backend
 	// When a Server has been created with an existing Redis connection, we do
 	// not want to close it.
 	sharedConnection bool
@@ -54,6 +55,7 @@ type Server struct {
 	healthchecker *healthchecker
 	janitor       *janitor
 	aggregator    *aggregator
+	runner        *backendRunner
 }
 
 type serverState struct {
@@ -410,6 +412,22 @@ var defaultQueueConfig = map[string]int{
 	base.DefaultQueueName: 1,
 }
 
+func normalizeServerQueues(queues map[string]int) map[string]int {
+	res := make(map[string]int)
+	for qname, p := range queues {
+		if err := base.ValidateQueueName(qname); err != nil {
+			continue
+		}
+		if p > 0 {
+			res[qname] = p
+		}
+	}
+	if len(res) == 0 {
+		res = defaultQueueConfig
+	}
+	return res
+}
+
 const (
 	defaultTaskCheckInterval = 1 * time.Second
 
@@ -438,6 +456,27 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 	return server
 }
 
+// NewServerWithBackend returns a new Server instance backed by a pluggable backend.
+func NewServerWithBackend(b Backend, cfg Config) *Server {
+	logger := log.NewLogger(cfg.Logger)
+	loglevel := cfg.LogLevel
+	if loglevel == level_unspecified {
+		loglevel = InfoLevel
+	}
+	logger.SetLevel(toInternalLogLevel(loglevel))
+	if len(cfg.Queues) == 0 {
+		cfg.Queues = map[string]int{"default": 1}
+	}
+	cfg.Queues = normalizeServerQueues(cfg.Queues)
+	srvState := &serverState{value: srvStateNew}
+	return &Server{
+		logger:  logger,
+		backend: b,
+		state:   srvState,
+		runner:  newBackendRunner(logger, b, cfg, srvState),
+	}
+}
+
 // NewServerFromRedisClient returns a new instance of Server given a redis.UniversalClient
 // and server configuration
 // Warning: The underlying redis connection pool will not be closed by Asynq, you are responsible for closing it.
@@ -464,18 +503,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	if isFailureFunc == nil {
 		isFailureFunc = defaultIsFailureFunc
 	}
-	queues := make(map[string]int)
-	for qname, p := range cfg.Queues {
-		if err := base.ValidateQueueName(qname); err != nil {
-			continue // ignore invalid queue names
-		}
-		if p > 0 {
-			queues[qname] = p
-		}
-	}
-	if len(queues) == 0 {
-		queues = defaultQueueConfig
-	}
+	queues := normalizeServerQueues(cfg.Queues)
 	var qnames []string
 	for q := range queues {
 		qnames = append(qnames, q)
@@ -605,6 +633,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	return &Server{
 		logger:           logger,
 		broker:           rdb,
+		backend:          nil,
 		sharedConnection: true,
 		state:            srvState,
 		forwarder:        forwarder,
@@ -681,6 +710,13 @@ func (srv *Server) Start(handler Handler) error {
 	if handler == nil {
 		return fmt.Errorf("asynq: server cannot run with nil handler")
 	}
+	if srv.backend != nil {
+		if err := srv.start(); err != nil {
+			return err
+		}
+		srv.runner.start(handler)
+		return nil
+	}
 	srv.processor.handler = handler
 
 	if err := srv.start(); err != nil {
@@ -736,18 +772,24 @@ func (srv *Server) Shutdown() {
 	// Sender goroutines should be terminated before the receiver goroutines.
 	// processor -> syncer (via syncCh)
 	// processor -> heartbeater (via starting, finished channels)
-	srv.forwarder.shutdown()
-	srv.processor.shutdown()
-	srv.recoverer.shutdown()
-	srv.syncer.shutdown()
-	srv.subscriber.shutdown()
-	srv.janitor.shutdown()
-	srv.aggregator.shutdown()
-	srv.healthchecker.shutdown()
-	srv.heartbeater.shutdown()
-	srv.wg.Wait()
+	if srv.backend != nil {
+		srv.runner.shutdown()
+	} else {
+		srv.forwarder.shutdown()
+		srv.processor.shutdown()
+		srv.recoverer.shutdown()
+		srv.syncer.shutdown()
+		srv.subscriber.shutdown()
+		srv.janitor.shutdown()
+		srv.aggregator.shutdown()
+		srv.healthchecker.shutdown()
+		srv.heartbeater.shutdown()
+		srv.wg.Wait()
+	}
 
-	if !srv.sharedConnection {
+	if srv.backend != nil {
+		_ = srv.backend.Close()
+	} else if !srv.sharedConnection {
 		srv.broker.Close()
 	}
 	srv.logger.Info("Exiting")
@@ -768,6 +810,13 @@ func (srv *Server) Stop() {
 	srv.state.value = srvStateStopped
 	srv.state.mu.Unlock()
 
+	if srv.backend != nil {
+		srv.logger.Info("Stopping backend workers")
+		srv.runner.shutdown()
+		srv.logger.Info("Backend workers stopped")
+		return
+	}
+
 	srv.logger.Info("Stopping processor")
 	srv.processor.stop()
 	srv.logger.Info("Processor stopped")
@@ -782,6 +831,8 @@ func (srv *Server) Ping() error {
 	if srv.state.value == srvStateClosed {
 		return nil
 	}
-
+	if srv.backend != nil {
+		return srv.backend.Ping(context.Background())
+	}
 	return srv.broker.Ping()
 }
