@@ -26,10 +26,16 @@ import (
 //
 // Clients are safe for concurrent use by multiple goroutines.
 type Client struct {
-	broker base.Broker
+	broker  base.Broker
+	backend Backend
 	// When a Client has been created with an existing Redis connection, we do
 	// not want to close it.
 	sharedConnection bool
+}
+
+// NewClientWithBackend returns a new Client instance backed by a pluggable backend.
+func NewClientWithBackend(b Backend) *Client {
+	return &Client{backend: b}
 }
 
 // NewClient returns a new Client instance given a redis connection option.
@@ -46,7 +52,8 @@ func NewClient(r RedisConnOpt) *Client {
 // NewClientFromRedisClient returns a new instance of Client given a redis.UniversalClient
 // Warning: The underlying redis connection pool will not be closed by Asynq, you are responsible for closing it.
 func NewClientFromRedisClient(c redis.UniversalClient) *Client {
-	return &Client{broker: rdb.NewRDB(c), sharedConnection: true}
+	b := rdb.NewRDB(c)
+	return &Client{broker: b, backend: nil, sharedConnection: true}
 }
 
 type OptionType int
@@ -348,6 +355,9 @@ var (
 
 // Close closes the connection with redis.
 func (c *Client) Close() error {
+	if c.backend != nil {
+		return c.backend.Close()
+	}
 	if c.sharedConnection {
 		return fmt.Errorf("redis connection is shared so the Client can't be closed through asynq")
 	}
@@ -496,6 +506,14 @@ type BatchEnqueueResult struct {
 // Immediate and scheduled (via [ProcessAt] or [ProcessIn]) tasks are supported.
 // Group and unique tasks are rejected as described above.
 func (c *Client) BatchEnqueueContext(ctx context.Context, tasks []*Task, opts ...Option) []BatchEnqueueResult {
+	if c.backend != nil {
+		results := make([]BatchEnqueueResult, len(tasks))
+		for i, task := range tasks {
+			info, err := c.EnqueueContext(ctx, task, opts...)
+			results[i] = BatchEnqueueResult{TaskInfo: info, Err: err}
+		}
+		return results
+	}
 	results := make([]BatchEnqueueResult, len(tasks))
 	if len(tasks) == 0 {
 		return results
@@ -594,10 +612,16 @@ func (c *Client) BatchEnqueueContext(ctx context.Context, tasks []*Task, opts ..
 
 // Ping performs a ping against the redis connection.
 func (c *Client) Ping() error {
+	if c.backend != nil {
+		return c.backend.Ping(context.Background())
+	}
 	return c.broker.Ping()
 }
 
 func (c *Client) enqueue(ctx context.Context, msg *base.TaskMessage, uniqueTTL time.Duration) error {
+	if c.backend != nil {
+		return c.backend.Enqueue(ctx, TaskMessageFromInternal(msg, time.Now()))
+	}
 	if uniqueTTL > 0 {
 		return c.broker.EnqueueUnique(ctx, msg, uniqueTTL)
 	}
@@ -605,6 +629,11 @@ func (c *Client) enqueue(ctx context.Context, msg *base.TaskMessage, uniqueTTL t
 }
 
 func (c *Client) schedule(ctx context.Context, msg *base.TaskMessage, t time.Time, uniqueTTL time.Duration) error {
+	if c.backend != nil {
+		publicMsg := TaskMessageFromInternal(msg, t)
+		publicMsg.RunAt = t
+		return c.backend.Enqueue(ctx, publicMsg)
+	}
 	if uniqueTTL > 0 {
 		ttl := time.Until(t.Add(uniqueTTL))
 		return c.broker.ScheduleUnique(ctx, msg, t, ttl)
@@ -613,6 +642,9 @@ func (c *Client) schedule(ctx context.Context, msg *base.TaskMessage, t time.Tim
 }
 
 func (c *Client) addToGroup(ctx context.Context, msg *base.TaskMessage, group string, uniqueTTL time.Duration) error {
+	if c.backend != nil {
+		return ErrFeatureNotSupported
+	}
 	if uniqueTTL > 0 {
 		return c.broker.AddToGroupUnique(ctx, msg, group, uniqueTTL)
 	}
